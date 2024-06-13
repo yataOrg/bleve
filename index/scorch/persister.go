@@ -267,36 +267,17 @@ func (s *Scorch) pausePersisterForMergerCatchUp(lastPersistedEpoch uint64,
 	// memory merge cum persist loop.
 	if numFilesOnDisk < uint64(po.PersisterNapUnderNumFiles) &&
 		po.PersisterNapTimeMSec > 0 && s.NumEventsBlocking() == 0 {
-		s.rootLock.RLock()
-		lastRootEpoch := s.root.epoch
-		s.rootLock.RUnlock()
-		expectedNapTime := time.Now().Add(time.Millisecond * time.Duration(po.PersisterNapTimeMSec))
-
 		select {
 		case <-s.closeCh:
 		case <-time.After(time.Millisecond * time.Duration(po.PersisterNapTimeMSec)):
 			atomic.AddUint64(&s.stats.TotPersisterNapPauseCompleted, 1)
 
 		case ew := <-s.persisterNotifier:
-			s.rootLock.RLock()
-			currRootEpoch := s.root.epoch
-			s.rootLock.RUnlock()
-
-			// if the snapshot didn't change when the merger notified the persister,
-			// it means that there weren't any meaningful merging operation done.
-			// in which case, let the persister nap for remaining time and then
-			// let the persister do some meaningful work.
-			if lastRootEpoch == currRootEpoch {
-				remainingNapDuration := time.Until(expectedNapTime)
-				time.Sleep(remainingNapDuration)
-				atomic.AddUint64(&s.stats.TotPersisterNapPauseCompleted, 1)
-			} else {
-				atomic.AddUint64(&s.stats.TotPersisterMergerNapBreak, 1)
-			}
 			// unblock the merger in meantime
 			persistWatchers = append(persistWatchers, ew)
 			lastMergedEpoch = ew.epoch
 			persistWatchers = notifyMergeWatchers(lastPersistedEpoch, persistWatchers)
+			atomic.AddUint64(&s.stats.TotPersisterMergerNapBreak, 1)
 		}
 		return lastMergedEpoch, persistWatchers
 	}
@@ -568,11 +549,14 @@ func prepareBoltSnapshot(snapshot *IndexSnapshot, tx *bolt.Tx, path string,
 		val := make([]byte, 8)
 		bytesWritten := atomic.LoadUint64(&snapshot.parent.stats.TotBytesWrittenAtIndexTime)
 		binary.LittleEndian.PutUint64(val, bytesWritten)
-		internalBucket.Put(TotBytesWrittenKey, val)
+		err = internalBucket.Put(TotBytesWrittenKey, val)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
-	var filenames []string
-	newSegmentPaths := make(map[uint64]string)
+	filenames := make([]string, 0, len(snapshot.segment))
+	newSegmentPaths := make(map[uint64]string, len(snapshot.segment))
 
 	// first ensure that each segment in this snapshot has been persisted
 	for _, segmentSnapshot := range snapshot.segment {
@@ -1001,7 +985,7 @@ func getTimeSeriesSnapshots(maxDataPoints int, interval time.Duration,
 	return ptr, rv
 }
 
-// getProtectedEpochs aims to fetch the epochs keep based on a timestamp basis.
+// getProtectedSnapshots aims to fetch the epochs keep based on a timestamp basis.
 // It tries to get NumSnapshotsToKeep snapshots, each of which are separated
 // by a time duration of RollbackSamplingInterval.
 func getProtectedSnapshots(rollbackSamplingInterval time.Duration,
@@ -1152,7 +1136,7 @@ func (s *Scorch) removeOldZapFiles() error {
 	for _, f := range files {
 		fname := f.Name()
 		if filepath.Ext(fname) == ".zap" {
-			if _, exists := liveFileNames[fname]; !exists && !s.ineligibleForRemoval[fname] {
+			if _, exists := liveFileNames[fname]; !exists && !s.ineligibleForRemoval[fname] && (s.copyScheduled[fname] <= 0) {
 				err := os.Remove(s.path + string(os.PathSeparator) + fname)
 				if err != nil {
 					log.Printf("got err removing file: %s, err: %v", fname, err)

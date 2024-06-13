@@ -19,6 +19,9 @@ package bleve
 
 import (
 	"archive/zip"
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -130,13 +133,15 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 	}
 
 	index := NewIndexAlias()
+	var reqSort = search.SortOrder{&search.SortScore{Desc: true}, &search.SortDocID{Desc: true}, &search.SortField{Desc: false, Field: "content"}}
 	for testCaseNum, testCase := range testCases {
+		originalRequest := searchRequests[testCase.queryIndex]
 		for _, operator := range knnOperators {
-			index.indexes = make([]Index, 0)
 
-			query := searchRequests[testCase.queryIndex]
+			index.indexes = make([]Index, 0)
+			query := copySearchRequest(originalRequest, nil)
 			query.AddKNNOperator(operator)
-			query.Sort = search.SortOrder{&search.SortScore{Desc: true}, &search.SortDocID{Desc: true}, &search.SortField{Desc: true, Field: "content"}}
+			query.Sort = reqSort.Copy()
 			query.Explain = true
 
 			nameToIndex := createPartitionedIndex(documents, index, 1, testCase.mapping, t, false)
@@ -150,7 +155,13 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 				t.Fatalf("test case #%d failed: expected control result hits to have valid `Index`", testCaseNum)
 			}
 			cleanUp(t, nameToIndex)
+
 			index.indexes = make([]Index, 0)
+			query = copySearchRequest(originalRequest, nil)
+			query.AddKNNOperator(operator)
+			query.Sort = reqSort.Copy()
+			query.Explain = true
+
 			nameToIndex = createPartitionedIndex(documents, index, testCase.numIndexPartitions, testCase.mapping, t, false)
 			experimentalResult, err := index.Search(query)
 			if err != nil {
@@ -165,6 +176,11 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 			cleanUp(t, nameToIndex)
 
 			index.indexes = make([]Index, 0)
+			query = copySearchRequest(originalRequest, nil)
+			query.AddKNNOperator(operator)
+			query.Sort = reqSort.Copy()
+			query.Explain = true
+
 			nameToIndex = createPartitionedIndex(documents, index, testCase.numIndexPartitions, testCase.mapping, t, true)
 			multiLevelIndexResult, err := index.Search(query)
 			if err != nil {
@@ -177,6 +193,7 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 			}
 			verifyResult(t, multiLevelIndexResult, experimentalResult, testCaseNum, false)
 			cleanUp(t, nameToIndex)
+
 		}
 	}
 
@@ -187,17 +204,14 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 		},
 	}
 
-	var sort = search.SortOrder{&search.SortScore{Desc: true}, &search.SortField{Desc: false, Field: "content"}}
-
 	index = NewIndexAlias()
 	for testCaseNum, testCase := range testCases {
 		index.indexes = make([]Index, 0)
 		nameToIndex := createPartitionedIndex(documents, index, testCase.numIndexPartitions, testCase.mapping, t, false)
 		originalRequest := searchRequests[testCase.queryIndex]
 		for _, operator := range knnOperators {
-
 			from, size := originalRequest.From, originalRequest.Size
-			query := copySearchRequest(searchRequests[testCase.queryIndex], nil)
+			query := copySearchRequest(originalRequest, nil)
 			query.AddKNNOperator(operator)
 			query.Explain = true
 			query.From = from
@@ -211,7 +225,7 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 
 			// 1. Sort And Facet are there
 			query.Facets = facets
-			query.Sort = sort
+			query.Sort = reqSort.Copy()
 
 			res1, err := index.Search(query)
 			if err != nil {
@@ -232,7 +246,7 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 
 			// 2. Sort is there, Facet is not there
 			query.Facets = nil
-			query.Sort = sort
+			query.Sort = reqSort.Copy()
 
 			res2, err := index.Search(query)
 			if err != nil {
@@ -279,7 +293,7 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 
 			// Test early exit fail case -> matchNone + facetRequest
 			query.Query = NewMatchNoneQuery()
-			query.Sort = sort
+			query.Sort = reqSort.Copy()
 			// control case
 			query.Facets = nil
 			res4Ctrl, err := index.Search(query)
@@ -321,7 +335,7 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 
 	// Test From + Size pagination for Hybrid Search (2-Phase)
 	query := copySearchRequest(searchRequests[4], nil)
-	query.Sort = sort
+	query.Sort = reqSort.Copy()
 	query.Facets = facets
 	query.Explain = true
 
@@ -330,7 +344,7 @@ func TestSimilaritySearchPartitionedIndex(t *testing.T) {
 	// Test From + Size pagination for Early Exit Hybrid Search (1-Phase)
 	query = copySearchRequest(searchRequests[4], nil)
 	query.Query = NewMatchNoneQuery()
-	query.Sort = sort
+	query.Sort = reqSort.Copy()
 	query.Facets = nil
 	query.Explain = true
 
@@ -397,10 +411,181 @@ func min(a, b int) int {
 	return b
 }
 
+func TestVectorBase64Index(t *testing.T) {
+	dataset, searchRequests, err := readDatasetAndQueries(testInputCompressedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := makeDatasetIntoDocuments(dataset)
+
+	_, searchRequestsCopy, err := readDatasetAndQueries(testInputCompressedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, doc := range documents {
+		vec, ok := doc["vector"].([]float32)
+		if !ok {
+			t.Fatal("Typecasting vector to float array failed")
+		}
+
+		buf := new(bytes.Buffer)
+		for _, v := range vec {
+			err := binary.Write(buf, binary.LittleEndian, v)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		doc["vectorEncoded"] = base64.StdEncoding.EncodeToString(buf.Bytes())
+	}
+
+	for _, sr := range searchRequestsCopy {
+		for _, kr := range sr.KNN {
+			kr.Field = "vectorEncoded"
+		}
+	}
+
+	contentFM := NewTextFieldMapping()
+	contentFM.Analyzer = en.AnalyzerName
+
+	vecFML2 := mapping.NewVectorFieldMapping()
+	vecFML2.Dims = testDatasetDims
+	vecFML2.Similarity = index.EuclideanDistance
+
+	vecBFML2 := mapping.NewVectorBase64FieldMapping()
+	vecBFML2.Dims = testDatasetDims
+	vecBFML2.Similarity = index.EuclideanDistance
+
+	vecFMDot := mapping.NewVectorFieldMapping()
+	vecFMDot.Dims = testDatasetDims
+	vecFMDot.Similarity = index.CosineSimilarity
+
+	vecBFMDot := mapping.NewVectorBase64FieldMapping()
+	vecBFMDot.Dims = testDatasetDims
+	vecBFMDot.Similarity = index.CosineSimilarity
+
+	indexMappingL2 := NewIndexMapping()
+	indexMappingL2.DefaultMapping.AddFieldMappingsAt("content", contentFM)
+	indexMappingL2.DefaultMapping.AddFieldMappingsAt("vector", vecFML2)
+	indexMappingL2.DefaultMapping.AddFieldMappingsAt("vectorEncoded", vecBFML2)
+
+	indexMappingDot := NewIndexMapping()
+	indexMappingDot.DefaultMapping.AddFieldMappingsAt("content", contentFM)
+	indexMappingDot.DefaultMapping.AddFieldMappingsAt("vector", vecFMDot)
+	indexMappingDot.DefaultMapping.AddFieldMappingsAt("vectorEncoded", vecBFMDot)
+
+	tmpIndexPathL2 := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPathL2)
+
+	tmpIndexPathDot := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPathDot)
+
+	indexL2, err := New(tmpIndexPathL2, indexMappingL2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := indexL2.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	indexDot, err := New(tmpIndexPathDot, indexMappingDot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := indexDot.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batchL2 := indexL2.NewBatch()
+	batchDot := indexDot.NewBatch()
+
+	for _, doc := range documents {
+		err = batchL2.Index(doc["id"].(string), doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = batchDot.Index(doc["id"].(string), doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = indexL2.Batch(batchL2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = indexDot.Batch(batchDot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, _ := range searchRequests {
+		for _, operator := range knnOperators {
+			controlQuery := searchRequests[i]
+			testQuery := searchRequestsCopy[i]
+
+			controlQuery.AddKNNOperator(operator)
+			testQuery.AddKNNOperator(operator)
+
+			controlResultL2, err := indexL2.Search(controlQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testResultL2, err := indexL2.Search(testQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if controlResultL2 != nil && testResultL2 != nil {
+				if len(controlResultL2.Hits) == len(testResultL2.Hits) {
+					for j, _ := range controlResultL2.Hits {
+						if controlResultL2.Hits[j].ID != testResultL2.Hits[j].ID {
+							t.Fatalf("testcase %d failed: expected hit id %s, got hit id %s", i, controlResultL2.Hits[j].ID, testResultL2.Hits[j].ID)
+						}
+					}
+				}
+			} else if (controlResultL2 == nil && testResultL2 != nil) ||
+				(controlResultL2 != nil && testResultL2 == nil) {
+				t.Fatalf("testcase %d failed: expected result %s, got result %s", i, controlResultL2, testResultL2)
+			}
+
+			controlResultDot, err := indexDot.Search(controlQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testResultDot, err := indexDot.Search(testQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if controlResultDot != nil && testResultDot != nil {
+				if len(controlResultDot.Hits) == len(testResultDot.Hits) {
+					for j, _ := range controlResultDot.Hits {
+						if controlResultDot.Hits[j].ID != testResultDot.Hits[j].ID {
+							t.Fatalf("testcase %d failed: expected hit id %s, got hit id %s", i, controlResultDot.Hits[j].ID, testResultDot.Hits[j].ID)
+						}
+					}
+				}
+			} else if (controlResultDot == nil && testResultDot != nil) ||
+				(controlResultDot != nil && testResultDot == nil) {
+				t.Fatalf("testcase %d failed: expected result %s, got result %s", i, controlResultDot, testResultDot)
+			}
+		}
+	}
+}
+
 type testDocument struct {
 	ID      string    `json:"id"`
 	Content string    `json:"content"`
-	Vector  []float64 `json:"vector"`
+	Vector  []float32 `json:"vector"`
 }
 
 func readDatasetAndQueries(fileName string) ([]testDocument, []*SearchRequest, error) {
@@ -745,6 +930,8 @@ func TestSimilaritySearchMultipleSegments(t *testing.T) {
 	indexMappingDotProduct.DefaultMapping.AddFieldMappingsAt("content", contentFieldMapping)
 	indexMappingDotProduct.DefaultMapping.AddFieldMappingsAt("vector", vecFieldMappingDot)
 
+	var reqSort = search.SortOrder{&search.SortScore{Desc: true}, &search.SortDocID{Desc: true}, &search.SortField{Desc: false, Field: "content"}}
+
 	testCases := []struct {
 		numSegments int
 		queryIndex  int
@@ -852,6 +1039,7 @@ func TestSimilaritySearchMultipleSegments(t *testing.T) {
 		},
 	}
 	for testCaseNum, testCase := range testCases {
+		originalRequest := searchRequests[testCase.queryIndex]
 		for _, operator := range knnOperators {
 			// run single segment test first
 			tmpIndexPath := createTmpIndexPath(t)
@@ -859,8 +1047,8 @@ func TestSimilaritySearchMultipleSegments(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			query := searchRequests[testCase.queryIndex]
-			query.Sort = search.SortOrder{&search.SortScore{Desc: true}, &search.SortDocID{Desc: true}, &search.SortField{Desc: false, Field: "content"}}
+			query := copySearchRequest(originalRequest, nil)
+			query.Sort = reqSort.Copy()
 			query.AddKNNOperator(operator)
 			query.Explain = true
 
@@ -882,7 +1070,13 @@ func TestSimilaritySearchMultipleSegments(t *testing.T) {
 				t.Fatalf("test case #%d failed: expected control result hits to have valid `Index`", testCaseNum)
 			}
 			if testCase.scoreValue == "none" {
+
+				query := copySearchRequest(originalRequest, nil)
+				query.Sort = reqSort.Copy()
+				query.AddKNNOperator(operator)
+				query.Explain = true
 				query.Score = testCase.scoreValue
+
 				expectedResultScoreNone, err := index.Search(query)
 				if err != nil {
 					cleanUp(t, nameToIndex)
@@ -893,7 +1087,6 @@ func TestSimilaritySearchMultipleSegments(t *testing.T) {
 					t.Fatalf("test case #%d failed: expected score none hits to have valid `Index`", testCaseNum)
 				}
 				verifyResult(t, controlResult, expectedResultScoreNone, testCaseNum, true)
-				query.Score = ""
 			}
 			cleanUp(t, nameToIndex)
 
@@ -910,6 +1103,12 @@ func TestSimilaritySearchMultipleSegments(t *testing.T) {
 				cleanUp(t, nameToIndex)
 				t.Fatal(err)
 			}
+
+			query = copySearchRequest(originalRequest, nil)
+			query.Sort = reqSort.Copy()
+			query.AddKNNOperator(operator)
+			query.Explain = true
+
 			experimentalResult, err := index.Search(query)
 			if err != nil {
 				cleanUp(t, nameToIndex)

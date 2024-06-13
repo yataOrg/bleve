@@ -72,6 +72,17 @@ OUTER:
 				ctrlMsg = ctrlMsgDflt
 			}
 			if ctrlMsg != nil {
+				continueMerge := s.fireEvent(EventKindPreMergeCheck, 0)
+				// The default, if there's no handler, is to continue the merge.
+				if !continueMerge {
+					// If it's decided that this merge can't take place now,
+					// begin the merge process all over again.
+					// Retry instead of blocking/waiting here since a long wait
+					// can result in more segments introduced i.e. s.root will
+					// be updated.
+					continue OUTER
+				}
+
 				startTime := time.Now()
 
 				// lets get started
@@ -281,11 +292,6 @@ func (s *Scorch) planMergeAtSnapshot(ctx context.Context,
 	defer cw.close()
 
 	go cw.listen()
-
-	if len(resultMergePlan.Tasks) == 0 {
-		atomic.AddUint64(&s.stats.TotFileMergePlanZeroTasks, 1)
-		return nil
-	}
 
 	for _, task := range resultMergePlan.Tasks {
 		if len(task.Segments) == 0 {
